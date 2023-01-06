@@ -48,8 +48,11 @@ void vqueue_put(VQueue* q, void* x) {
         assert("head index equals tail index", h == t);
         int cap_new = 2 * n;
         void** new = xmalloc(cap_new * sizeof(void*));
+        // |*******************|
+        //        h            n
+        //        t            n
         memcpy(new, q->data + h, (n - h) * sizeof(void*));
-        memcpy(new + (n - h), q->data, h * sizeof(void*));
+        memcpy(new + (n - h), q->data, t * sizeof(void*));
         free(q->data);
         q->cap = cap_new;
         q->head = 0;
@@ -77,8 +80,12 @@ void* vqueue_get(VQueue* q) {
         if (cap_new < INITIAL_CAP) cap_new = INITIAL_CAP;
         void** new = xmalloc(cap_new * sizeof(void*));
         if (h <= t) {
+            // |---********--------|
+            //     h       t       n
             memcpy(new, q->data + h, (t - h) * sizeof(void*));
         } else {
+            // |******        *****|
+            //        t       h    n
             memcpy(new, q->data + h, (n - h) * sizeof(void*));
             memcpy(new + (n - h), q->data, t * sizeof(void*));
         }

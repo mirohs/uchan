@@ -733,3 +733,19 @@ int i_rnd(int i) {
     ensure("random number in range", 0 <= result && result < i);
     return result;
 }
+
+// Generates a random permutation of indices 0..n-1.
+// indices must point to an array of length n.
+void permute_indices(int* indices, int n) {
+    require_not_null(indices);
+    for (int i = 0; i < n; i++) {
+        indices[i] = i;
+    }
+    for (int i = n - 1; i >= 0; i--) {
+        int j = i_rnd(i + 1);
+        int h = indices[i];
+        indices[i] = indices[j];
+        indices[j] = h;
+    }
+}
+

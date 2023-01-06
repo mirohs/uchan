@@ -458,6 +458,7 @@ timespec time_now(void);
 double time_ms_since(timespec t);
 
 int i_rnd(int i);
+void permute_indices(int* indices, int n);
 
 /** 
 Checks whether the actual int (first argument) is equal to the expected int

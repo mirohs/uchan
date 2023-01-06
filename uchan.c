@@ -1,8 +1,8 @@
 /*
-UChan is an unbounded first-in-first-out communication channel between multiple
-threads. UChan is implemented using pthreads [pthreads Wikipedia][pthreads
-OpenGroup]. It differs from Go channels [Go channels] in that it does not have a
-fixed capacity.
+UChan is an unbounded first-in-first-out communication channel for communication
+between multiple threads. UChan is implemented using pthreads [pthreads
+Wikipedia][pthreads OpenGroup]. It differs from Go channels [Go channels] in
+that it does not have a fixed capacity.
 
 Guarantees of the channel API:
 - FIFO behavior: order sent (from the same thread) equals order received
@@ -27,21 +27,22 @@ unblocked in the order in which they called pthread_cond_wait.
 */
 
 #include <pthread.h>
+#include <stdatomic.h>
 #include "uchan.h"
 #include "vqueue.h"
 
-#define DEBUG_LOG //stderr_log("q=%d, s=%d, r=%d", queue_len(ch->queue), ch->n_waiting_senders, ch->n_waiting_receivers);
+#define DEBUG_LOG //stderr_log("q=%d, r=%d", vqueue_len(ch->queue), ch->n_waiting_receivers);
 
 // Required for casts between void* and long int.
 _Static_assert(sizeof(void*) == sizeof(long int), "valid size");
 
-// A channel-select thread sends or receives one item to/from a channel. Such
-// threads may be cancelled if another thread was selected. Information about the
-// item that is processed by the thread is stored as thread-specific data
-// (thread-local storage):
+// A channel-select thread receives one item from a channel. Such threads may be
+// cancelled if another channel was selected. Information about the item that is
+// processed by the thread is stored as thread-specific data (thread-local
+// storage):
 pthread_key_t key_chan_select_item;
 typedef struct UChanSelectItem UChanSelectItem;
-bool uchan_select_continue(UChanSelectItem* csi);
+static bool select_continue(UChanSelectItem* item);
 
 struct UChan {
     pthread_mutex_t mutex;
@@ -97,24 +98,6 @@ void uchan_send(UChan* ch, /*in*/void* x) {
 
     panic_if(ch->closed, "send on closed channel");
 
-#if 0
-    DEBUG_LOG
-    UChanSelectItem* item = pthread_getspecific(key_chan_select_item);
-    // stderr_log("key = %lu, item = %p", key_chan_select_item, item);
-    if (item != NULL && !uchan_select_continue(item)) {
-        DEBUG_LOG
-        /*
-        error = pthread_cond_broadcast(&ch->waiting_receivers);
-        panic_if(error != 0, "error %d", error);
-        */
-        error = pthread_mutex_unlock(&ch->mutex);
-        panic_if(error != 0, "error %d", error);
-        pthread_exit(NULL);
-        assert("not reached", false);
-    }
-    DEBUG_LOG
-#endif
-
     vqueue_put(ch->queue, x);
 
     error = pthread_cond_broadcast(&ch->waiting_receivers);
@@ -147,18 +130,16 @@ bool uchan_receive2(UChan* ch, /*out*/void** x) {
         DEBUG_LOG
     }
 
-#if 0
     DEBUG_LOG
     UChanSelectItem* item = pthread_getspecific(key_chan_select_item);
     // stderr_log("key = %lu, item = %p", key_chan_select_item, item);
-    if (item != NULL && !uchan_select_continue(item)) {
+    if (item != NULL && !select_continue(item)) {
         DEBUG_LOG
         error = pthread_mutex_unlock(&ch->mutex);
         panic_if(error != 0, "error %d", error);
         pthread_exit(NULL);
         assert("not reached", false);
     }
-#endif
 
     DEBUG_LOG
     assert("not closed implies queue not empty", !vqueue_empty(ch->queue) || ch->closed);
@@ -276,201 +257,165 @@ bool uchan_receive2_noblock(UChan* ch, /*out*/void** x) {
     return has_value;
 }
 
-#if 0
+// The rest of this file implements support for channel selection when receiving.
+
+typedef struct UChanSelect UChanSelect;
 typedef struct UChanSelectItem UChanSelectItem;
-struct UChanSelectItem {
-    UChanSelect* cs;
-    UChan* ch;
-    void* x;
-    bool* has_value;
-    pthread_t thread;
-    UChanSelectItem* next;
-};
 
 struct UChanSelect {
+    UChan** channels;
+    int n_channels;
+    atomic_int remaining_threads;
     UChanSelectItem* items;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     UChanSelectItem* selected;
 };
 
-UChanSelect* uchan_select_new(void) {
-    UChanSelect* cs = xcalloc(1, sizeof(UChanSelect));
-    int error;
+struct UChanSelectItem {
+    UChanSelect* cs;
+    UChan* ch;
+    int index;
+    bool has_value;
+    void* x;
+    pthread_t thread;
+};
 
-    error = pthread_mutex_init(&cs->mutex, NULL);
-    panic_if(error != 0, "error %d", error);
+static int uchan_select_noblock(UChan** channels, int n_channels, void** x, bool* has_value) {
+    require_not_null(channels);
+    require("positive", n_channels > 0);
+    require_not_null(x);
 
-    error = pthread_cond_init(&cs->cond, NULL);
-    panic_if(error != 0, "error %d", error);
+    int indices[n_channels];
+    permute_indices(indices, n_channels);
 
-    return cs;
+    for (int i = 0; i < n_channels; i++) {
+        UChan* ch = channels[indices[i]];
+        bool ok = uchan_receive2_noblock(ch, x);
+        if (has_value != NULL) *has_value = ok;
+        if (ok) return i;
+    }
+    return -1;
 }
 
-void uchan_select_free(UChanSelect* cs) {
+static void signal_if_last_select_thread(UChanSelect* cs) {
     require_not_null(cs);
-    UChanSelectItem* item_next;
-    for (UChanSelectItem* item = cs->items; item; item = item_next) {
-        item_next = item->next;
-        // todo: destroy thread
-        free(item);
-    }
-    // todo: destroy mutex and cond
-    free(cs);
-}
-
-static void permute_indices(int* indices, int n) {
-    for (int i = 0; i < n; i++) {
-        indices[i] = i;
-    }
-    for (int i = n - 1; i >= 0; i--) {
-        int j = i_rnd(i + 1);
-        int h = indices[i];
-        indices[i] = indices[j];
-        indices[j] = h;
+    int n = atomic_fetch_sub(&cs->remaining_threads, 1);
+    stderr_log("remaining threads = %d", n);
+    if (n <= 1) {
+        int error = pthread_cond_signal(&cs->cond);
+        panic_if(error != 0, "error %d", error);
     }
 }
 
-UChan* uchan_select_noblock(UChanSelect* cs) {
-    require_not_null(cs);
-    int n = 0;
-    for (UChanSelectItem* item = cs->items; item; item = item->next) {
-        n++;
-    }
-    UChanSelectItem* items[n];
-    int i = 0;
-    for (UChanSelectItem* item = cs->items; item; item = item->next) {
-        items[i++] = item;
-    }
-    int indices[n];
-    permute_indices(indices, n);
-
-    for (i = 0; i < n; i++) {
-        UChanSelectItem* item = items[indices[i]];
-        UChan* ch = item->ch;
-        if (uchan_receive2_noblock(ch, item->x)) return ch;
-    }
-    // assert: none of the channels was ready for communication
-    return NULL;
-}
-
-void cleanup_select_thread(void* arg) {
+void select_thread_cleanup(void* arg) {
+    require_not_null(arg);
     UChanSelectItem* item = arg;
-    stderr_log("item = %p", item);
+    stderr_log("item = %d", item->index);
     int error = pthread_mutex_unlock(&item->ch->mutex);
     panic_if(error != 0, "error %d", error);
+    signal_if_last_select_thread(item->cs);
 }
 
-void* uchan_select_item_func(void* arg) {
+static void* select_thread_func(void* arg) {
+    require_not_null(arg);
     UChanSelectItem* item = arg;
     int error = pthread_setspecific(key_chan_select_item, item);
     panic_if(error != 0, "error %d", error);
-    pthread_cleanup_push(cleanup_select_thread, item);
-    *item->has_value = uchan_receive2(item->ch, item->x);
-    stderr_log("received: %d, ok = %d", (int)*(long int*)item->x, *item->has_value);
-    // signal select thread that a response is available
-    error = pthread_cond_signal(&item->cs->cond);
-    panic_if(error != 0, "error %d", error);
+    pthread_cleanup_push(select_thread_cleanup, item);
+
+    item->has_value = uchan_receive2(item->ch, &item->x);
+    stderr_log("from ch %d received: %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
+
+    signal_if_last_select_thread(item->cs);
     pthread_cleanup_pop(0);
     return NULL;
 }
 
-UChan* uchan_select(UChanSelect* cs) {
-    require_not_null(cs);
+int uchan_select(UChan** channels, int n_channels, void** x, bool* has_value) {
+    require_not_null(channels);
+    require("positive", n_channels > 0);
+    require_not_null(x);
 
-    // try non-blocking communication first
-    UChan* ch = NULL;//uchan_select_noblock(cs);
-    stderr_log("noblock ch = %p", ch);
-    if (ch != NULL) return ch;
+    // try non-blocking receive first
+    int i_selected = uchan_select_noblock(channels, n_channels, x, has_value);
+    stderr_log("noblock ch = %d", i_selected);
+    if (i_selected >= 0) return i_selected;
 
-    // communicate with the channels using separate threads
-    for (UChanSelectItem* item = cs->items; item; item = item->next) {
-        int error = pthread_create(&item->thread, NULL, uchan_select_item_func, item);
+    UChanSelect cs = {0};
+    cs.channels = channels;
+    cs.n_channels = n_channels;
+    cs.items = xcalloc(n_channels, sizeof(UChanSelectItem));
+    atomic_store(&cs.remaining_threads, n_channels);
+    for (int i = 0; i < n_channels; i++) {
+        UChanSelectItem* item = cs.items + i;
+        item->cs = &cs;
+        item->ch = channels[i];
+        item->index = i;
+    }
+
+    int error = pthread_mutex_init(&cs.mutex, NULL);
+    panic_if(error != 0, "error %d", error);
+    error = pthread_cond_init(&cs.cond, NULL);
+    panic_if(error != 0, "error %d", error);
+
+    // receive from the channels using separate threads
+    for (int i = 0; i < n_channels; i++) {
+        UChanSelectItem* item = cs.items + i;
+        int error = pthread_create(&item->thread, NULL, select_thread_func, item);
         panic_if(error != 0, "error %d", error);
     }
 
     // then wait
-    int error = pthread_mutex_lock(&cs->mutex);
+    error = pthread_mutex_lock(&cs.mutex);
     panic_if(error != 0, "error %d", error);
 
-    stderr_log("");
-
-    error = pthread_cond_wait(&cs->cond, &cs->mutex);
+    stderr_log("waiting");
+    error = pthread_cond_wait(&cs.cond, &cs.mutex);
     panic_if(error != 0, "error %d", error);
-    assert("selection done", cs->selected != NULL);
+    assert("selection done", cs.selected != NULL);
+    stderr_log("waiting completed");
 
-    stderr_log("sel = %p, x = %d", cs->selected, (int)(long int)cs->selected->x);
+    UChanSelectItem* item = cs.selected;
+    stderr_log("selected channel: %d, x = %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
 
-    /*
-    // done, cancel threads
-    for (UChanSelectItem* item = cs->items; item; item = item->next) {
-        if (item != cs->selected && item->thread != NULL) {
-            error = pthread_cancel(item->thread);
-            panic_if(error != 0, "error %d", error);
-            // todo: have to release mutex of item->thread?
-        }
-        // todo: delete item?
-    }
-    */
+    *has_value = item->has_value;
+    *x = item->x;
+    i_selected = item->index;
 
-    error = pthread_mutex_unlock(&cs->mutex);
+    error = pthread_mutex_unlock(&cs.mutex);
+    panic_if(error != 0, "error %d", error);
+    error = pthread_cond_destroy(&cs.cond);
+    panic_if(error != 0, "error %d", error);
+    error = pthread_mutex_destroy(&cs.mutex);
     panic_if(error != 0, "error %d", error);
 
-    UChanSelectItem* selected = cs->selected;
-    // todo: delete item?
-    return selected->ch;
+    return i_selected;
 }
 
 // Checks whether csi is the selected channel operation, i.e. whether it should
 // actually be executed.
-bool uchan_select_continue(UChanSelectItem* csi) {
-    UChanSelect* cs = csi->cs;
+static bool select_continue(UChanSelectItem* requesting) {
+    UChanSelect* cs = requesting->cs;
     bool result = false;
     int error = pthread_mutex_lock(&cs->mutex);
     panic_if(error != 0, "error %d", error);
     if (cs->selected == NULL) {
-        cs->selected = csi;
+        cs->selected = requesting;
         result = true;
+        stderr_log("selected = %d", cs->selected->index);
         // cancel all other select threads
-        for (UChanSelectItem* item = cs->items; item; item = item->next) {
-            stderr_log("sel = %p, item = %p", cs->selected, item);
-            if (item != csi) {
+        for (int i = 0; i < cs->n_channels; i++) {
+            UChanSelectItem* item = cs->items + i;
+            if (item != requesting) {
                 error = pthread_cancel(item->thread);
                 panic_if(error != 0, "error %d", error);
-                // todo: have to release mutex of item->thread?
             }
         }
+    } else {
+        stderr_log("not selected: %d", requesting->index);
     }
     error = pthread_mutex_unlock(&cs->mutex);
     panic_if(error != 0, "error %d", error);
     return result;
 }
-
-// Registers a receive on channel ch for a subsequent select operation. The
-// result is written to *x. *has_value indicates whether a value was received.
-// has_value is allowed to be be NULL. If no value is available, e.g. because
-// the channel has been closed, x is set to NULL.
-void uchan_select_receive(UChanSelect* cs, UChan* ch, /*out*/void** x, /*out*/bool* has_value) {
-    require_not_null(cs);
-    require_not_null(ch);
-    require_not_null(x);
-    UChanSelectItem* i = xcalloc(1, sizeof(UChanSelectItem));
-    i->cs = cs;
-    i->ch = ch;
-    i->x = x;
-    i->has_value = has_value;
-    i->next = cs->items;
-    cs->items = i;
-}
-
-// Registers a receive on channel ch for a subsequent select operation. The
-// result is written to *x. *has_value indicates whether a value was received.
-// has_value is allowed to be be NULL. If no value is available, e.g. because
-// the channel has been closed, x is set to NULL.
-void uchan_select_receive_int(UChanSelect* cs, UChan* ch, /*out*/int* x, /*out*/bool* has_value) {
-    require_not_null(cs);
-    require_not_null(ch);
-    require_not_null(x);
-    uchan_select_receive(cs, ch, (void**)x, has_value);
-}
-#endif

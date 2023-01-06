@@ -22,16 +22,8 @@ int uchan_receive_int(UChan* ch);
 
 bool uchan_receive2(UChan* ch, void** x);
 bool uchan_receive2_int(UChan* ch, int* x);
-bool uchan_receive2_noblock(UChan* ch, /*in*/void** x);
+bool uchan_receive2_noblock(UChan* ch, void** x);
 
-#if 0
-typedef struct UChanSelect UChanSelect;
-UChanSelect* uchan_select_new(void);
-void uchan_select_free(UChanSelect* cs);
-UChan* uchan_select(UChanSelect* cs);
-UChan* uchan_select_noblock(UChanSelect* cs);
-void uchan_select_receive(UChanSelect* cs, UChan* ch, void** x, /*out*/bool* has_value);
-void uchan_select_receive_int(UChanSelect* cs, UChan* ch, int* x, /*out*/bool* has_value);
-#endif
+int uchan_select(UChan** channels, int n_channels, void** x, bool* has_value);
 
 #endif // uchan_h_INCLUDED
