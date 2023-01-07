@@ -31,6 +31,11 @@ unblocked in the order in which they called pthread_cond_wait.
 #include "uchan.h"
 #include "vqueue.h"
 
+#if 1
+#undef stderr_log
+#define stderr_log(...)
+#endif
+
 // Required for casts between void* and long int.
 _Static_assert(sizeof(void*) == sizeof(long int), "valid size");
 
@@ -162,8 +167,7 @@ void uchan_send_int(UChan* ch, int x) {
 int uchan_receive_int(UChan* ch) {
     require_not_null(ch);
     void* p = uchan_receive(ch);
-    long int x = (long int)p;
-    return (int)x;
+    return (int)(long int)p;
 }
 
 // Receives a value from the channel and writes it to x. Blocks until a value is
@@ -175,8 +179,7 @@ bool uchan_receive2_int(UChan* ch, /*out*/int* x) {
     void* p = NULL;
     bool has_value = uchan_receive2(ch, &p);
     if (has_value) {
-        long int lx = (long int)p;
-        *x = (int)lx;
+        *x = (int)(long int)p;
     } else {
         *x = 0;
     }
@@ -308,9 +311,10 @@ static void* select_thread_func(void* arg) {
     pthread_cleanup_push(select_thread_cleanup, item);
 
     item->has_value = uchan_receive2(item->ch, &item->x);
-    stderr_log("from ch %d received: %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
+    stderr_log("from channel %d received: %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
 
-    pthread_cleanup_pop(1);
+    signal_if_last_select_thread(item->cs);
+    pthread_cleanup_pop(0);
     return NULL;
 }
 
@@ -321,7 +325,7 @@ int uchan_select(UChan** channels, int n_channels, void** x, bool* has_value) {
 
     // try non-blocking receive first
     int i_selected = uchan_select_noblock(channels, n_channels, x, has_value);
-    stderr_log("noblock ch = %d", i_selected);
+    stderr_log("noblock channel = %d", i_selected);
     if (i_selected >= 0) return i_selected;
 
     UChanSelect cs = {0};
@@ -362,7 +366,7 @@ int uchan_select(UChan** channels, int n_channels, void** x, bool* has_value) {
     stderr_log("waiting completed");
 
     UChanSelectItem* item = cs.selected;
-    stderr_log("selected channel: %d, x = %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
+    stderr_log("selected channel %d: x = %d, ok = %d", item->index, (int)(long int)item->x, item->has_value);
 
     if (has_value != NULL) {
         *has_value = item->has_value;
@@ -390,17 +394,18 @@ static void check_select_continue(UChanSelectItem* requesting) {
     if (cs->selected == NULL) {
         cs->selected = requesting;
         is_selected = true;
-        stderr_log("selected: %d", cs->selected->index);
+        stderr_log("selected channel %d", cs->selected->index);
         // cancel all other select threads
         for (int i = 0; i < cs->n_channels; i++) {
             UChanSelectItem* item = cs->items + i;
             if (item != requesting) {
+                stderr_log("cancelling item %d", item->index);
                 error = pthread_cancel(item->thread);
                 panic_if(error != 0, "error %d", error);
             }
         }
     } else {
-        stderr_log("not selected: %d", requesting->index);
+        stderr_log("channel %d not selected, exit", requesting->index);
     }
     error = pthread_mutex_unlock(&cs->mutex);
     panic_if(error != 0, "error %d", error);
