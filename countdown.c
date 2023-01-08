@@ -20,7 +20,7 @@ struct Countdown {
 };
 
 Countdown* countdown_new(int n) {
-    require("positive", n > 0);
+    require("not negative", n >= 0);
     Countdown* c = xmalloc(sizeof(Countdown));
     atomic_store(&c->n, n);
     int error = pthread_mutex_init(&c->mutex, NULL);
