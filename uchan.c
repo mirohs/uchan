@@ -52,6 +52,9 @@ struct UChan {
     pthread_cond_t waiting_receivers;
     VQueue* queue;
     bool closed;
+    bool finishing;
+    int n_waiting_receivers;
+    pthread_cond_t no_waiting_receivers;
 };
 
 // Creates a channel.
@@ -71,6 +74,9 @@ UChan* uchan_new(void) {
     error = pthread_cond_init(&ch->waiting_receivers, NULL);
     panic_if(error != 0, "error %d", error);
 
+    error = pthread_cond_init(&ch->no_waiting_receivers, NULL);
+    panic_if(error != 0, "error %d", error);
+
     ch->queue = vqueue_new();
 
     return ch;
@@ -79,10 +85,24 @@ UChan* uchan_new(void) {
 // Frees the resources associated with this channel.
 void uchan_free(UChan* ch) {
     require_not_null(ch);
-    if (!ch->closed) {
-        uchan_close(ch);
+
+    // wait for receivers to complete
+    int error = pthread_mutex_lock(&ch->mutex);
+    panic_if(error != 0, "error %d", error);
+    ch->closed = true;
+    if (ch->n_waiting_receivers > 0) {
+        ch->finishing = true;
+        error = pthread_cond_broadcast(&ch->waiting_receivers);
+        panic_if(error != 0, "error %d", error);
+        error = pthread_cond_wait(&ch->no_waiting_receivers, &ch->mutex);
+        panic_if(error != 0, "error %d", error);
     }
-    int error = pthread_cond_destroy(&ch->waiting_receivers);
+    error = pthread_mutex_unlock(&ch->mutex);
+    panic_if(error != 0, "error %d", error);
+
+    error = pthread_cond_destroy(&ch->waiting_receivers);
+    panic_if(error != 0, "error %d", error);
+    error = pthread_cond_destroy(&ch->no_waiting_receivers);
     panic_if(error != 0, "error %d", error);
     error = pthread_mutex_destroy(&ch->mutex);
     panic_if(error != 0, "error %d", error);
@@ -122,6 +142,7 @@ bool uchan_receive2(UChan* ch, /*out*/void** x) {
     int error = pthread_mutex_lock(&ch->mutex);
     panic_if(error != 0, "error %d", error);
 
+    ch->n_waiting_receivers++;
     while (vqueue_empty(ch->queue) && !ch->closed) {
         error = pthread_cond_wait(&ch->waiting_receivers, &ch->mutex);
         panic_if(error != 0, "error %d", error);
@@ -129,6 +150,8 @@ bool uchan_receive2(UChan* ch, /*out*/void** x) {
 
     UChanSelectItem* item = pthread_getspecific(key_chan_select_item);
     if (item != NULL) check_select_continue(item);
+    ch->n_waiting_receivers--;
+    assert("not negative", ch->n_waiting_receivers >= 0);
 
     assert("not closed implies queue not empty", ch->closed || !vqueue_empty(ch->queue));
     bool has_value = !vqueue_empty(ch->queue);
@@ -136,6 +159,11 @@ bool uchan_receive2(UChan* ch, /*out*/void** x) {
         *x = vqueue_get(ch->queue);
     } else {
         *x = NULL;
+    }
+
+    if (ch->finishing && ch->n_waiting_receivers <= 0) {
+        error = pthread_cond_signal(&ch->no_waiting_receivers);
+        panic_if(error != 0, "error %d", error);
     }
 
     error = pthread_mutex_unlock(&ch->mutex);
@@ -148,6 +176,7 @@ bool uchan_receive2(UChan* ch, /*out*/void** x) {
 // channel is already closed, returns values that are still in the channel. If the
 // channel is closed and there are no more values in the channel, returns NULL.
 void* uchan_receive(UChan* ch) {
+    require_not_null(ch);
     void* x;
     uchan_receive2(ch, &x);
     return x;
@@ -297,6 +326,9 @@ static void signal_if_last_select_thread(UChanSelect* cs) {
 static void select_thread_cleanup(void* arg) {
     require_not_null(arg);
     UChanSelectItem* item = arg;
+    // assert: thread has ch->mutex
+    item->ch->n_waiting_receivers--;
+    assert("not negative", item->ch->n_waiting_receivers >= 0);
     stderr_log("cleanup item %d", item->index);
     int error = pthread_mutex_unlock(&item->ch->mutex);
     panic_if(error != 0, "error %d", error);
@@ -387,10 +419,12 @@ int uchan_select(UChan** channels, int n_channels, void** x, bool* has_value) {
 // Checks whether csi is the selected channel operation, i.e. whether it should
 // actually be executed.
 static void check_select_continue(UChanSelectItem* requesting) {
+    require_not_null(requesting);
     UChanSelect* cs = requesting->cs;
     bool is_selected = false;
-    int error = pthread_mutex_lock(&cs->mutex);
-    panic_if(error != 0, "error %d", error);
+    int error;
+    // int error = pthread_mutex_lock(&cs->mutex);
+    // panic_if(error != 0, "error %d", error);
     if (cs->selected == NULL) {
         cs->selected = requesting;
         is_selected = true;
@@ -407,8 +441,8 @@ static void check_select_continue(UChanSelectItem* requesting) {
     } else {
         stderr_log("channel %d not selected, exit", requesting->index);
     }
-    error = pthread_mutex_unlock(&cs->mutex);
-    panic_if(error != 0, "error %d", error);
+    // error = pthread_mutex_unlock(&cs->mutex);
+    // panic_if(error != 0, "error %d", error);
     if (!is_selected) {
         pthread_exit(NULL);
         assert("not reached", false);
